@@ -1,0 +1,925 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, Tuple, List
+import json
+import math
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+
+
+# ============================================================
+# LC-NE GAIN FAILURE: FORMAL ROBUSTNESS SIMULATION
+# ============================================================
+# Main model:
+#   S_cog(t) = alpha * G_LC(t) - beta * D_state(t) - gamma * V_arousal(t)
+#
+# Interpretation:
+#   S_cog(t) > 0  -> task-relevant cognitive state remains stable.
+#   S_cog(t) <= 0 -> vulnerability to lapse, distractor capture, drift,
+#                    unstable recall, failed encoding, or inefficient switching.
+#
+# This is a formal model-behavior simulation, not patient-level validation.
+# ============================================================
+
+
+@dataclass(frozen=True)
+class ModelParams:
+    T: float = 240.0
+    fs: float = 20.0
+
+    event_start: float = 20.0
+    event_interval: float = 30.0
+    event_width: float = 1.6
+    task_window_post: float = 6.0
+    early_window_post: float = 2.5
+
+    alpha: float = 1.00
+    beta: float = 0.85
+    gamma: float = 0.65
+
+    # For fast first run: 100 and 100.
+    # For final output: 250-500 and 300-1000.
+    n_subjects: int = 250
+    n_sensitivity: int = 300
+
+    seed: int = 42
+    subject_cv: float = 0.08
+    sensitivity_cv: float = 0.12
+
+
+PROFILES: Dict[str, Dict[str, float]] = {
+    "Healthy adaptive gain": {
+        "tonic_gain": 0.40,
+        "phasic_amp": 0.80,
+        "gain_delay": 0.15,
+        "arousal_base": 0.13,
+        "arousal_sigma": 0.015,
+        "base_disp": 0.33,
+        "dispersion_noise": 0.015,
+        "k_event_uncertainty": 0.10,
+        "k_gain_stabilize": 0.36,
+        "k_vol_disp": 0.10,
+    },
+    "Hypogain": {
+        "tonic_gain": 0.30,
+        "phasic_amp": 0.28,
+        "gain_delay": 0.15,
+        "arousal_base": 0.18,
+        "arousal_sigma": 0.018,
+        "base_disp": 0.43,
+        "dispersion_noise": 0.018,
+        "k_event_uncertainty": 0.14,
+        "k_gain_stabilize": 0.20,
+        "k_vol_disp": 0.10,
+    },
+    "Hypertonic noise": {
+        "tonic_gain": 0.48,
+        "phasic_amp": 0.38,
+        "gain_delay": 0.25,
+        "arousal_base": 0.45,
+        "arousal_sigma": 0.055,
+        "base_disp": 0.42,
+        "dispersion_noise": 0.035,
+        "k_event_uncertainty": 0.14,
+        "k_gain_stabilize": 0.19,
+        "k_vol_disp": 0.45,
+    },
+    "Gain mistiming": {
+        "tonic_gain": 0.34,
+        "phasic_amp": 0.70,
+        "gain_delay": 4.00,
+        "arousal_base": 0.22,
+        "arousal_sigma": 0.020,
+        "base_disp": 0.43,
+        "dispersion_noise": 0.020,
+        "k_event_uncertainty": 0.25,
+        "k_gain_stabilize": 0.27,
+        "k_vol_disp": 0.10,
+    },
+}
+
+CONDITION_ORDER = list(PROFILES.keys())
+
+
+# ============================================================
+# 1. Plot style
+# ============================================================
+
+def set_publication_style() -> None:
+    plt.rcParams.update({
+        "figure.dpi": 130,
+        "savefig.dpi": 600,
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "legend.fontsize": 9,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    })
+
+
+# ============================================================
+# 2. Utility functions
+# ============================================================
+
+def gaussian(t: np.ndarray, mu: float, sigma: float) -> np.ndarray:
+    return np.exp(-0.5 * ((t - mu) / sigma) ** 2)
+
+
+def safe_trapezoid(y: np.ndarray, x: np.ndarray) -> float:
+    if hasattr(np, "trapezoid"):
+        return float(np.trapezoid(y, x))
+    return float(np.trapz(y, x))
+
+
+def ou_process(
+    n: int,
+    rng: np.random.Generator,
+    theta: float,
+    sigma: float,
+    mu: float = 0.0
+) -> np.ndarray:
+    x = np.zeros(n)
+    x[0] = mu
+
+    for i in range(1, n):
+        x[i] = x[i - 1] + theta * (mu - x[i - 1]) + sigma * rng.normal()
+
+    return x
+
+
+def build_event_drive(
+    t: np.ndarray,
+    params: ModelParams
+) -> Tuple[np.ndarray, np.ndarray]:
+
+    event_times = np.arange(
+        params.event_start,
+        params.T - params.event_interval / 2,
+        params.event_interval
+    )
+
+    event_drive = np.zeros_like(t)
+
+    for event in event_times:
+        event_drive += gaussian(t, event, params.event_width)
+
+    return np.clip(event_drive, 0, 1), event_times
+
+
+def make_window_mask(
+    t: np.ndarray,
+    event_times: np.ndarray,
+    post: float
+) -> np.ndarray:
+
+    mask = np.zeros_like(t, dtype=bool)
+
+    for event in event_times:
+        mask |= (t >= event) & (t <= event + post)
+
+    return mask
+
+
+def positive_lognormal_jitter(
+    value: float,
+    rng: np.random.Generator,
+    cv: float,
+    floor: float = 1e-6
+) -> float:
+
+    if value <= 0:
+        return value
+
+    return float(max(floor, value * np.exp(rng.normal(0.0, cv))))
+
+
+def sample_profile(
+    base: Dict[str, float],
+    rng: np.random.Generator,
+    cv: float
+) -> Dict[str, float]:
+
+    cfg = {}
+
+    for key, value in base.items():
+        if key == "gain_delay":
+            delay_sd = 0.12 if value < 1.0 else 0.40
+            cfg[key] = max(0.0, float(value + rng.normal(0.0, delay_sd)))
+        else:
+            cfg[key] = positive_lognormal_jitter(float(value), rng, cv)
+
+    return cfg
+
+
+# ============================================================
+# 3. Core simulation
+# ============================================================
+
+def simulate_arrays(
+    condition: str,
+    cfg: Dict[str, float],
+    params: ModelParams,
+    rng: np.random.Generator,
+    alpha: float | None = None,
+    beta: float | None = None,
+    gamma: float | None = None,
+) -> Dict[str, np.ndarray]:
+
+    alpha = params.alpha if alpha is None else alpha
+    beta = params.beta if beta is None else beta
+    gamma = params.gamma if gamma is None else gamma
+
+    t = np.arange(0, params.T, 1 / params.fs)
+
+    event_drive, event_times = build_event_drive(t, params)
+    task_window = make_window_mask(t, event_times, params.task_window_post)
+    early_window = make_window_mask(t, event_times, params.early_window_post)
+
+    gain_drive = np.zeros_like(t)
+
+    for event in event_times:
+        gain_drive += gaussian(t, event + cfg["gain_delay"], params.event_width)
+
+    gain_drive = np.clip(gain_drive, 0, 1)
+
+    G_LC = (
+        cfg["tonic_gain"]
+        + cfg["phasic_amp"] * gain_drive
+        + 0.01 * rng.normal(size=t.size)
+    )
+
+    V_arousal = (
+        cfg["arousal_base"]
+        + np.abs(
+            ou_process(
+                n=t.size,
+                rng=rng,
+                theta=0.05,
+                sigma=cfg["arousal_sigma"],
+                mu=0.0,
+            )
+        )
+    )
+
+    D_state = (
+        cfg["base_disp"]
+        + cfg["k_event_uncertainty"] * event_drive
+        + cfg["k_vol_disp"] * V_arousal
+        - cfg["k_gain_stabilize"] * G_LC
+        + cfg["dispersion_noise"] * rng.normal(size=t.size)
+    )
+
+    G_LC = np.clip(G_LC, 0, 1.50)
+    V_arousal = np.clip(V_arousal, 0, 1.30)
+    D_state = np.clip(D_state, 0, 1.30)
+
+    S_cog = alpha * G_LC - beta * D_state - gamma * V_arousal
+
+    return {
+        "t": t,
+        "event_drive": event_drive,
+        "gain_drive": gain_drive,
+        "G_LC": G_LC,
+        "D_state": D_state,
+        "V_arousal": V_arousal,
+        "S_cog": S_cog,
+        "task_window": task_window,
+        "early_window": early_window,
+        "event_times": event_times,
+    }
+
+
+# ============================================================
+# 4. Metrics
+# ============================================================
+
+def zero_crossings(x: np.ndarray) -> int:
+    signs = np.signbit(x)
+    return int(np.sum(signs[1:] != signs[:-1]))
+
+
+def unstable_dwell_times(t: np.ndarray, unstable: np.ndarray) -> np.ndarray:
+    if len(t) < 2:
+        return np.array([])
+
+    dt = np.median(np.diff(t))
+    dwell = []
+    current = 0
+
+    for value in unstable:
+        if value:
+            current += 1
+        elif current > 0:
+            dwell.append(current * dt)
+            current = 0
+
+    if current > 0:
+        dwell.append(current * dt)
+
+    return np.array(dwell)
+
+
+def instability_burden(t: np.ndarray, S: np.ndarray) -> float:
+    duration = t[-1] - t[0]
+
+    if duration <= 0:
+        return np.nan
+
+    negative_part = np.maximum(0, -S)
+
+    return safe_trapezoid(negative_part, t) / duration
+
+
+def event_gain_lag(
+    t: np.ndarray,
+    gain_drive: np.ndarray,
+    event_times: np.ndarray,
+    search_post: float = 8.0
+) -> float:
+
+    lags: List[float] = []
+
+    for event in event_times:
+        mask = (t >= event) & (t <= event + search_post)
+
+        if not np.any(mask):
+            continue
+
+        tt = t[mask]
+        gg = gain_drive[mask]
+        lags.append(float(tt[np.argmax(gg)] - event))
+
+    return float(np.mean(lags)) if lags else np.nan
+
+
+def recovery_latency_after_event(
+    t: np.ndarray,
+    S: np.ndarray,
+    event_times: np.ndarray,
+    search_post: float = 8.0
+) -> float:
+
+    latencies: List[float] = []
+
+    for event in event_times:
+        mask = (t >= event) & (t <= event + search_post)
+
+        if not np.any(mask):
+            continue
+
+        tt = t[mask]
+        ss = S[mask]
+
+        positive_idx = np.where(ss > 0)[0]
+
+        if positive_idx.size > 0:
+            latencies.append(float(tt[positive_idx[0]] - event))
+        else:
+            latencies.append(search_post)
+
+    return float(np.mean(latencies)) if latencies else np.nan
+
+
+def compute_metrics(arr: Dict[str, np.ndarray]) -> Dict[str, float]:
+
+    t = arr["t"]
+    S = arr["S_cog"]
+    G = arr["G_LC"]
+    D = arr["D_state"]
+    V = arr["V_arousal"]
+
+    task = arr["task_window"]
+    early = arr["early_window"]
+
+    S_task = S[task]
+    t_task = t[task]
+
+    unstable = S_task <= 0
+    dwell = unstable_dwell_times(t_task, unstable)
+
+    raw_behavioral = (
+        0.45 * float(np.mean(unstable))
+        + 0.35 * instability_burden(t_task, S_task)
+        + 0.10 * float(np.std(S_task, ddof=1))
+        + 0.10 * float(np.mean(S[early] <= 0))
+    )
+
+    return {
+        "mean_S_cog": float(np.mean(S_task)),
+        "median_S_cog": float(np.median(S_task)),
+        "min_S_cog": float(np.min(S_task)),
+        "sd_S_cog": float(np.std(S_task, ddof=1)),
+        "P_unstable": float(np.mean(unstable)),
+        "P_early_unstable": float(np.mean(S[early] <= 0)),
+        "instability_burden": instability_burden(t_task, S_task),
+        "zero_crossings": zero_crossings(S_task),
+        "crossings_per_min": zero_crossings(S_task) / ((t_task[-1] - t_task[0]) / 60.0),
+        "mean_unstable_dwell_s": float(np.mean(dwell)) if dwell.size else 0.0,
+        "max_unstable_dwell_s": float(np.max(dwell)) if dwell.size else 0.0,
+        "mean_G_LC": float(np.mean(G[task])),
+        "mean_D_state": float(np.mean(D[task])),
+        "mean_V_arousal": float(np.mean(V[task])),
+        "event_gain_lag_s": event_gain_lag(t, arr["gain_drive"], arr["event_times"]),
+        "recovery_latency_s": recovery_latency_after_event(t, S, arr["event_times"]),
+        "B_instability_raw": raw_behavioral,
+    }
+
+
+def normalize_behavioral_index(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    x = out["B_instability_raw"].to_numpy()
+
+    x_min = float(np.min(x))
+    x_max = float(np.max(x))
+
+    if math.isclose(x_min, x_max):
+        out["B_instability_0_1"] = 0.0
+    else:
+        out["B_instability_0_1"] = (x - x_min) / (x_max - x_min)
+
+    return out
+
+
+def summarize_by_condition(df: pd.DataFrame) -> pd.DataFrame:
+
+    metrics = [
+        "mean_S_cog",
+        "P_unstable",
+        "P_early_unstable",
+        "instability_burden",
+        "crossings_per_min",
+        "mean_unstable_dwell_s",
+        "event_gain_lag_s",
+        "recovery_latency_s",
+        "B_instability_0_1",
+    ]
+
+    rows = []
+
+    for condition in CONDITION_ORDER:
+        sub = df[df["condition"] == condition]
+        row = {"condition": condition, "n": len(sub)}
+
+        for metric in metrics:
+            vals = sub[metric].to_numpy()
+            row[f"{metric}_mean"] = float(np.mean(vals))
+            row[f"{metric}_sd"] = float(np.std(vals, ddof=1))
+            row[f"{metric}_q025"] = float(np.quantile(vals, 0.025))
+            row[f"{metric}_q975"] = float(np.quantile(vals, 0.975))
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# 5. Cohort and sensitivity analyses
+# ============================================================
+
+def run_cohort(params: ModelParams) -> Tuple[pd.DataFrame, pd.DataFrame]:
+
+    rng = np.random.default_rng(params.seed)
+
+    metric_rows = []
+    rep_rows = []
+
+    for condition in CONDITION_ORDER:
+        base = PROFILES[condition]
+
+        for subject_id in range(params.n_subjects):
+            subject_cfg = sample_profile(base, rng, params.subject_cv)
+            arr = simulate_arrays(condition, subject_cfg, params, rng)
+
+            row = {
+                "condition": condition,
+                "subject_id": subject_id,
+            }
+
+            row.update(compute_metrics(arr))
+            metric_rows.append(row)
+
+            if subject_id == 0:
+                tmp = pd.DataFrame({
+                    "condition": condition,
+                    "t": arr["t"],
+                    "event_drive": arr["event_drive"],
+                    "gain_drive": arr["gain_drive"],
+                    "G_LC": arr["G_LC"],
+                    "D_state": arr["D_state"],
+                    "V_arousal": arr["V_arousal"],
+                    "S_cog": arr["S_cog"],
+                    "task_window": arr["task_window"],
+                    "early_window": arr["early_window"],
+                })
+
+                rep_rows.append(tmp)
+
+    metrics_df = pd.DataFrame(metric_rows)
+    metrics_df = normalize_behavioral_index(metrics_df)
+
+    representative_df = pd.concat(rep_rows, ignore_index=True)
+
+    return metrics_df, representative_df
+
+
+def run_sensitivity(params: ModelParams) -> Tuple[pd.DataFrame, pd.DataFrame]:
+
+    rng = np.random.default_rng(params.seed + 100000)
+
+    rows = []
+
+    for sensitivity_id in range(params.n_sensitivity):
+        alpha = params.alpha * rng.uniform(0.75, 1.25)
+        beta = params.beta * rng.uniform(0.75, 1.25)
+        gamma = params.gamma * rng.uniform(0.75, 1.25)
+
+        for condition in CONDITION_ORDER:
+            cfg = sample_profile(PROFILES[condition], rng, params.sensitivity_cv)
+            arr = simulate_arrays(condition, cfg, params, rng, alpha=alpha, beta=beta, gamma=gamma)
+            met = compute_metrics(arr)
+
+            rows.append({
+                "sensitivity_id": sensitivity_id,
+                "condition": condition,
+                "alpha": alpha,
+                "beta": beta,
+                "gamma": gamma,
+                "P_unstable": met["P_unstable"],
+                "mean_S_cog": met["mean_S_cog"],
+                "instability_burden": met["instability_burden"],
+                "P_early_unstable": met["P_early_unstable"],
+            })
+
+    sens_df = pd.DataFrame(rows)
+
+    pivot = sens_df.pivot(
+        index="sensitivity_id",
+        columns="condition",
+        values="P_unstable",
+    )
+
+    pairwise_rows = []
+
+    for cond_i in CONDITION_ORDER:
+        for cond_j in CONDITION_ORDER:
+            if cond_i == cond_j:
+                p = 0.5
+            else:
+                p = float(np.mean(pivot[cond_i].to_numpy() > pivot[cond_j].to_numpy()))
+
+            pairwise_rows.append({
+                "row_condition_more_unstable": cond_i,
+                "column_condition": cond_j,
+                "P_row_greater_than_column": p,
+            })
+
+    pairwise_df = pd.DataFrame(pairwise_rows)
+
+    return sens_df, pairwise_df
+
+
+# ============================================================
+# 6. Plotting helpers
+# ============================================================
+
+def save_figure(fig: plt.Figure, out_path_no_suffix: Path) -> None:
+    fig.tight_layout()
+
+    for suffix in [".png", ".svg", ".pdf"]:
+        fig.savefig(out_path_no_suffix.with_suffix(suffix), bbox_inches="tight")
+
+    plt.close(fig)
+
+
+def condition_short_label(label: str) -> str:
+    mapping = {
+        "Healthy adaptive gain": "Healthy\nadaptive gain",
+        "Hypogain": "Hypogain",
+        "Hypertonic noise": "Hypertonic\nnoise",
+        "Gain mistiming": "Gain\nmistiming",
+    }
+
+    return mapping[label]
+
+
+def add_panel_label(ax: plt.Axes, label: str) -> None:
+    ax.text(
+        -0.08, 1.08, label,
+        transform=ax.transAxes,
+        fontsize=13,
+        fontweight="bold",
+        va="top",
+        ha="left",
+    )
+
+
+# ============================================================
+# 7. Figures
+# ============================================================
+
+def plot_representative_stability(
+    rep: pd.DataFrame,
+    summary: pd.DataFrame,
+    fig_dir: Path
+) -> None:
+
+    fig, axes = plt.subplots(4, 1, figsize=(11.5, 8.5), sharex=True)
+
+    for ax, condition in zip(axes, CONDITION_ORDER):
+        sub = rep[rep["condition"] == condition]
+
+        t = sub["t"].to_numpy()
+        S = sub["S_cog"].to_numpy()
+
+        ax.plot(t, S, linewidth=1.5)
+        ax.axhline(0, linestyle="--", linewidth=1.1)
+
+        ax.fill_between(
+            t,
+            S,
+            0,
+            where=S <= 0,
+            alpha=0.22,
+            interpolate=True,
+        )
+
+        event_times = np.arange(20.0, 240.0 - 15.0, 30.0)
+
+        for ev in event_times:
+            ax.axvline(ev, linewidth=0.5, alpha=0.12)
+
+        row = summary[summary["condition"] == condition].iloc[0]
+
+        metric_text = (
+            rf"$\overline{{S}}_{{cog}}$={row['mean_S_cog_mean']:.2f}, "
+            rf"$P_{{unstable}}$={row['P_unstable_mean']:.2f}"
+        )
+
+        ax.set_title(f"{condition}   |   {metric_text}", loc="left")
+        ax.set_ylabel(r"$S_{\mathrm{cog}}(t)$")
+
+    axes[-1].set_xlabel("Time (s)")
+
+    fig.suptitle(
+        "Model-behavior simulation of cognitive-state stability under four LC-NE gain regimes",
+        y=1.02,
+        fontsize=13,
+    )
+
+    save_figure(fig, fig_dir / "FigS1_representative_stability_timeseries")
+
+
+def plot_cohort_distributions(
+    metrics: pd.DataFrame,
+    fig_dir: Path
+) -> None:
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 8.0))
+
+    fig.suptitle(
+        "Cohort-level model outputs across simulated gain-control regimes",
+        y=1.02,
+        fontsize=13
+    )
+
+    plot_specs = [
+        ("P_unstable", r"$P(S_{\mathrm{cog}}(t)\leq 0)$", "A"),
+        ("mean_S_cog", r"Mean $S_{\mathrm{cog}}(t)$", "B"),
+        ("instability_burden", "Instability burden", "C"),
+        ("B_instability_0_1", "Relative behavioral instability index", "D"),
+    ]
+
+    for ax, (metric, ylabel, panel) in zip(axes.ravel(), plot_specs):
+        data = [
+            metrics.loc[metrics["condition"] == c, metric].to_numpy()
+            for c in CONDITION_ORDER
+        ]
+
+        bp = ax.boxplot(
+            data,
+            patch_artist=True,
+            showfliers=False,
+            widths=0.55,
+            medianprops={"linewidth": 1.6},
+            boxprops={"linewidth": 1.1},
+            whiskerprops={"linewidth": 1.0},
+            capprops={"linewidth": 1.0},
+        )
+
+        for box in bp["boxes"]:
+            box.set_alpha(0.35)
+
+        rng = np.random.default_rng(123)
+
+        for i, vals in enumerate(data, start=1):
+            if len(vals) > 120:
+                vals_plot = rng.choice(vals, size=120, replace=False)
+            else:
+                vals_plot = vals
+
+            x = rng.normal(i, 0.035, size=len(vals_plot))
+            ax.scatter(x, vals_plot, s=8, alpha=0.25, linewidth=0)
+
+        ax.set_xticks(range(1, len(CONDITION_ORDER) + 1))
+        ax.set_xticklabels([condition_short_label(c) for c in CONDITION_ORDER])
+        ax.set_ylabel(ylabel)
+        ax.yaxis.set_major_locator(MaxNLocator(5))
+        add_panel_label(ax, panel)
+
+    save_figure(fig, fig_dir / "FigS2_cohort_metric_distributions")
+
+
+def plot_component_traces(
+    rep: pd.DataFrame,
+    fig_dir: Path
+) -> None:
+
+    fig, axes = plt.subplots(4, 1, figsize=(11.5, 9.2), sharex=True)
+
+    for ax, condition in zip(axes, CONDITION_ORDER):
+        sub = rep[rep["condition"] == condition]
+
+        t = sub["t"].to_numpy()
+
+        ax.plot(t, sub["G_LC"], linewidth=1.2, label=r"$G_{\mathrm{LC}}(t)$")
+        ax.plot(t, sub["D_state"], linewidth=1.2, label=r"$D_{\mathrm{state}}(t)$")
+        ax.plot(t, sub["V_arousal"], linewidth=1.2, label=r"$V_{\mathrm{arousal}}(t)$")
+        ax.plot(t, sub["S_cog"], linewidth=1.5, label=r"$S_{\mathrm{cog}}(t)$")
+
+        ax.axhline(0, linestyle="--", linewidth=1.0)
+        ax.set_title(condition, loc="left")
+        ax.set_ylabel("Model variables")
+
+    axes[0].legend(frameon=False, ncol=4, loc="upper right")
+    axes[-1].set_xlabel("Time (s)")
+
+    fig.suptitle(
+        "Representative model components under each gain-control regime",
+        y=1.02,
+        fontsize=13
+    )
+
+    save_figure(fig, fig_dir / "FigS3_representative_model_components")
+
+
+def plot_sensitivity(
+    sens: pd.DataFrame,
+    pairwise: pd.DataFrame,
+    fig_dir: Path
+) -> None:
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8))
+
+    ax = axes[0]
+
+    data = [
+        sens.loc[sens["condition"] == c, "P_unstable"].to_numpy()
+        for c in CONDITION_ORDER
+    ]
+
+    bp = ax.boxplot(
+        data,
+        patch_artist=True,
+        showfliers=False,
+        widths=0.55
+    )
+
+    for box in bp["boxes"]:
+        box.set_alpha(0.35)
+
+    ax.set_xticks(range(1, len(CONDITION_ORDER) + 1))
+    ax.set_xticklabels([condition_short_label(c) for c in CONDITION_ORDER])
+    ax.set_ylabel(r"$P(S_{\mathrm{cog}}(t)\leq 0)$")
+    ax.set_title("Parameter-perturbation sensitivity", loc="left")
+    add_panel_label(ax, "A")
+
+    matrix = np.zeros((len(CONDITION_ORDER), len(CONDITION_ORDER)))
+
+    for i, cond_i in enumerate(CONDITION_ORDER):
+        for j, cond_j in enumerate(CONDITION_ORDER):
+            val = pairwise[
+                (pairwise["row_condition_more_unstable"] == cond_i)
+                & (pairwise["column_condition"] == cond_j)
+            ]["P_row_greater_than_column"].iloc[0]
+
+            matrix[i, j] = val
+
+    ax = axes[1]
+
+    im = ax.imshow(matrix, vmin=0, vmax=1, aspect="auto")
+
+    ax.set_xticks(range(len(CONDITION_ORDER)))
+    ax.set_yticks(range(len(CONDITION_ORDER)))
+
+    ax.set_xticklabels(
+        [condition_short_label(c) for c in CONDITION_ORDER],
+        rotation=35,
+        ha="right"
+    )
+
+    ax.set_yticklabels([condition_short_label(c) for c in CONDITION_ORDER])
+
+    ax.set_title("Pairwise probability of greater instability", loc="left")
+    add_panel_label(ax, "B")
+
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            ax.text(
+                j,
+                i,
+                f"{matrix[i, j]:.2f}",
+                ha="center",
+                va="center",
+                fontsize=8
+            )
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Probability")
+
+    fig.suptitle(
+        "Robustness of regime-specific instability signatures",
+        y=1.03,
+        fontsize=13
+    )
+
+    save_figure(fig, fig_dir / "FigS4_sensitivity_and_rank_robustness")
+
+
+# ============================================================
+# 8. Main execution
+# ============================================================
+
+def main() -> None:
+
+    set_publication_style()
+
+    params = ModelParams()
+
+    output_dir = Path("lcne_if10_outputs")
+    table_dir = output_dir / "tables"
+    fig_dir = output_dir / "figures"
+
+    table_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(output_dir / "simulation_parameters.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "ModelParams": asdict(params),
+                "Profiles": PROFILES,
+                "Condition order": CONDITION_ORDER,
+                "Model equation": "S_cog(t) = alpha*G_LC(t) - beta*D_state(t) - gamma*V_arousal(t)",
+                "Threshold": "S_cog(t) <= 0 indicates instability vulnerability",
+            },
+            f,
+            indent=2
+        )
+
+    print("Running cohort-level Monte Carlo simulation...")
+    metrics_df, representative_df = run_cohort(params)
+    condition_summary = summarize_by_condition(metrics_df)
+
+    print("Running parameter-sensitivity analysis...")
+    sensitivity_df, pairwise_df = run_sensitivity(params)
+
+    metrics_df.to_csv(table_dir / "cohort_subject_level_metrics.csv", index=False)
+    representative_df.to_csv(table_dir / "representative_timeseries.csv", index=False)
+    condition_summary.to_csv(table_dir / "condition_level_summary.csv", index=False)
+    sensitivity_df.to_csv(table_dir / "sensitivity_analysis_metrics.csv", index=False)
+    pairwise_df.to_csv(table_dir / "sensitivity_pairwise_rank_probabilities.csv", index=False)
+
+    print("Generating publication-quality figures...")
+
+    plot_representative_stability(representative_df, condition_summary, fig_dir)
+    plot_cohort_distributions(metrics_df, fig_dir)
+    plot_component_traces(representative_df, fig_dir)
+    plot_sensitivity(sensitivity_df, pairwise_df, fig_dir)
+
+    display_cols = [
+        "condition",
+        "n",
+        "mean_S_cog_mean",
+        "P_unstable_mean",
+        "P_early_unstable_mean",
+        "instability_burden_mean",
+        "B_instability_0_1_mean",
+        "event_gain_lag_s_mean",
+    ]
+
+    print("\nAnalysis complete.")
+    print(f"Outputs saved to: {output_dir.resolve()}\n")
+    print(condition_summary[display_cols].round(4).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
