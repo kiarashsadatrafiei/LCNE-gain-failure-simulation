@@ -38,8 +38,8 @@ These regimes correspond to distinct proposed mechanisms of noradrenergic gain f
 The simulation includes:
 
 - representative stability traces;
-- cohort-level Monte Carlo simulation;
-- simulated inter-individual variability;
+- Monte Carlo ensemble of stochastic parameter realizations;
+- stochastic variation around imposed parameter setting;
 - parameter-sensitivity analysis;
 - pairwise robustness analysis of instability signatures.
 
@@ -120,7 +120,7 @@ lcne_if10_outputs/tables/sensitivity_pairwise_rank_probabilities.csv
 
 ## Interpretation
 
-This simulation is intended as a formal model-behavior illustration. It is not patient-level empirical validation and does not estimate biological parameters from human or animal data. Its purpose is to show how distinct LC–NE gain-control regimes can generate separable instability signatures under the same stability-margin equation.
+This simulation is intended as a formal model-behavior illustration. It is not patient-level empirical validation and does not estimate biological parameters from human or animal data. Its purpose is to show how distinct LC–NE gain-control regimes can generate produce distinct forward-model outputs under imposed generative assumptions; this does not establish biological identifiability.
 
 The simulation should therefore be interpreted as a supplementary formal analysis supporting the operational structure of the model, rather than as direct evidence for clinical diagnosis, prognosis, or treatment response.
 
